@@ -907,14 +907,20 @@ def module_diff(modname, old_ns, new_ns):
                 if ks and all(isinstance(k, type) for k in ks):
                     keys = [(k.__module__, k.__qualname__) for k in ks]
                 elif ks and all(isinstance(k, str) for k in ks):
-                    keys = ("str", sorted(ks))
+                    vals = [d[k] for d in (a, b) for k in ks if k in d]
+                    keys = (
+                        "str",
+                        sorted(ks),
+                        sorted({v for v in vals if isinstance(v, str)}),
+                        all(isinstance(v, str) for v in vals),
+                    )
             elif isinstance(a, (set, frozenset, list, tuple)) and isinstance(b, (set, frozenset, list, tuple)):
                 try:
                     sa, sb = set(a), set(b)
                 except TypeError:
                     sa = sb = None
                 if sa is not None and sa != sb and all(isinstance(x, str) for x in sa ^ sb):
-                    keys = ("str", sorted(sa ^ sb))
+                    keys = ("str", sorted(sa ^ sb), [], True)
             out.append((q, name, keys))
     return out
 
@@ -1237,13 +1243,19 @@ class Selector:
         root_items = [(q, name, keys) for q, name, keys in diff if (q, name) in roots]
         if not root_items:
             return None
-        words = set()
-        raw = set()
         lexical_bases = (
             "sqlglot.tokens:Tokenizer", "sqlglot.tokenizer_core:TokenizerCore",
             "sqlglot.parser:Parser", "sqlglot.generator:Generator",
             "sqlglot.dialects.dialect:Dialect",
         )
+        raw = set()
+        groups = []  # a test passes the gate if it has every word of some group
+
+        def add_group(text):
+            toks = [w.upper() for w in _WORD_RE.findall(text)]
+            if toks:
+                groups.append(toks)
+
         for q, name, keys in root_items:
             if not (isinstance(keys, tuple) and keys and keys[0] == "str"):
                 return None
@@ -1258,19 +1270,40 @@ class Selector:
                 return None
             for k in keys[1]:
                 raw.add(k.upper())
-                for w in _WORD_RE.findall(k):
-                    words.add(w.upper())
-        if not words:
+                add_group(k)
+        # String values of changed entries (old and new), and the keys of
+        # derived string-to-string tables (inverse mappings): generated SQL
+        # shows these, not the edited key.
+        for q, name, keys in diff:
+            if not (isinstance(keys, tuple) and keys and keys[0] == "str"):
+                continue
+            for v in keys[2] if len(keys) > 2 else ():
+                add_group(v)
+            if (q, name) not in roots and len(keys) > 3 and keys[3]:
+                for k in keys[1]:
+                    add_group(k)
+        if not groups:
             return None
         g = set()
         vocab = m.vocab
-        for w in words:
-            if len(w) == 1 and not w.isalnum():
-                hit = [w] if w in vocab else []
-            else:
-                hit = [v for v in vocab if w in v]
-            for v in hit:
-                g |= m.sets[vocab[v]]
+        cache = {}
+        for toks in groups:
+            kg = None
+            for w in toks:
+                ws = cache.get(w)
+                if ws is None:
+                    if len(w) == 1 and not w.isalnum():
+                        hit = [w] if w in vocab else []
+                    else:
+                        hit = [v for v in vocab if w in v]
+                    ws = set()
+                    for v in hit:
+                        ws |= m.sets[vocab[v]]
+                    cache[w] = ws
+                kg = set(ws) if kg is None else (kg & ws)
+                if not kg:
+                    break
+            g |= kg or set()
         for k in raw:
             for f, line in m.str_sites.get(k, ()):
                 g |= m.line_info(f, line)[0]
@@ -1552,6 +1585,11 @@ def split(tests_ms):
 
 
 def main():
+    # Loading the map makes many small objects that live until exit; the
+    # cyclic garbage collector would only spend time walking them.
+    import gc
+
+    gc.disable()
     t0 = time.process_time()
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
