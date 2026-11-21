@@ -260,47 +260,66 @@ for rel, tree in py_sources.items():
 sites = {}
 
 
-def add_site(name, rel, line, kind):
+def add_site(name, rel, line, kind, owner=""):
     if name in candidates:
-        sites.setdefault(name, set()).add((rel, line, kind))
+        sites.setdefault(name, set()).add((rel, line, kind, owner if kind else ""))
 
 
-def visit(node, rel, in_func):
+def _base_name(node):
+    """Last name in the expression an attribute hangs off: ``a.b.C.X`` -> C."""
+    v = node.value
+    if isinstance(v, ast.Attribute):
+        return v.attr
+    if isinstance(v, ast.Name):
+        return v.id
+    return "?"
+
+
+def visit(node, rel, in_func, qual=""):
+    """qual: class path of the class body we are in (module level: "")."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         for d in node.decorator_list:
-            visit(d, rel, in_func)
+            visit(d, rel, in_func, qual)
         for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
-            visit(d, rel, in_func)
+            visit(d, rel, in_func, qual)
         for st in node.body:
-            visit(st, rel, True)
+            visit(st, rel, True, qual)
         return
     if isinstance(node, ast.Lambda):
         for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
-            visit(d, rel, in_func)
-        visit(node.body, rel, True)
+            visit(d, rel, in_func, qual)
+        visit(node.body, rel, True, qual)
         return
     if isinstance(node, ast.ClassDef):
         for d in node.decorator_list + node.bases + [k.value for k in node.keywords]:
-            visit(d, rel, in_func)
+            visit(d, rel, in_func, qual)
+        inner = (qual + "." if qual else "") + node.name
         for st in node.body:
-            visit(st, rel, in_func)
+            visit(st, rel, in_func, inner if not in_func else qual)
         return
     if isinstance(node, ast.AnnAssign):
-        visit(node.target, rel, in_func)
+        visit(node.target, rel, in_func, qual)
         if node.value is not None:
-            visit(node.value, rel, in_func)
+            visit(node.value, rel, in_func, qual)
         return
     kind = 0 if in_func else 1
     if isinstance(node, ast.Name):
         if not isinstance(node.ctx, ast.Store):
-            add_site(node.id, rel, node.lineno, kind)
+            add_site(node.id, rel, node.lineno, kind, f"n:{module_of(rel)}:{qual}")
     elif isinstance(node, ast.Attribute):
         if not isinstance(node.ctx, ast.Store):
-            add_site(node.attr, rel, node.lineno, kind)
+            add_site(node.attr, rel, node.lineno, kind, "a:" + _base_name(node))
     elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-        add_site(node.value, rel, node.lineno, kind)
+        # "S": a plain string; "s": a string handed to getattr() and friends.
+        add_site(node.value, rel, node.lineno, kind, "S")
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in (
+        "getattr", "setattr", "hasattr", "delattr"
+    ):
+        for a in node.args:
+            if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                add_site(a.value, rel, a.lineno, kind, "s")
     for child in ast.iter_child_nodes(node):
-        visit(child, rel, in_func)
+        visit(child, rel, in_func, qual)
 
 
 for rel, tree in py_sources.items():

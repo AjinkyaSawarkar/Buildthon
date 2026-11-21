@@ -756,22 +756,190 @@ def _load_sqlglot():
     return _sqlglot_loaded["ok"]
 
 
-def import_ok(modname, path, code, timeout=20.0):
-    """Run the patched module's top-level code in a forked child, against the
-    original versions of every other module. False when it raises or hangs."""
-    if not hasattr(os, "fork") or not _load_sqlglot():
+_SKIP_ATTRS = {
+    "__dict__", "__weakref__", "__module__", "__doc__", "__qualname__", "__firstlineno__",
+    "__static_attributes__", "__annotations__", "__annotate__", "__annotate_func__",
+    "__annotations_cache__", "__orig_bases__", "__parameters__", "__slots__",
+}
+
+
+def _canon(obj, depth=0, active=None):
+    """A hashable summary of a value that is equal for the old and the new
+    module when the value is the same, even though the objects differ."""
+    import enum
+    import functools
+    import re
+    import types
+
+    if active is None:
+        active = set()
+    if obj is None or isinstance(obj, (bool, int, float, str, bytes, complex)):
+        return ("v", type(obj).__name__, obj if not isinstance(obj, float) or obj == obj else "nan")
+    if isinstance(obj, enum.Enum):
+        return ("enum", type(obj).__module__, type(obj).__qualname__, obj.name)
+    if isinstance(obj, type):
+        return ("class", obj.__module__, obj.__qualname__)
+    if isinstance(obj, types.ModuleType):
+        return ("module", obj.__name__)
+    if depth > 14:
+        return ("deep", type(obj).__qualname__)
+    key = id(obj)
+    if key in active:
+        return ("cycle",)
+    active.add(key)
+    try:
+        d = depth + 1
+        if isinstance(obj, types.FunctionType):
+            cells = ()
+            if obj.__closure__:
+                cells = tuple(
+                    _canon(c.cell_contents, d, active) if _cell_ok(c) else ("empty",) for c in obj.__closure__
+                )
+            return ("func", _canon_code(obj.__code__), _canon(obj.__defaults__, d, active),
+                    _canon(obj.__kwdefaults__, d, active), cells)
+        if isinstance(obj, (types.BuiltinFunctionType, types.MethodWrapperType, types.WrapperDescriptorType)):
+            return ("builtin", getattr(obj, "__qualname__", repr(obj)))
+        if isinstance(obj, types.MethodType):
+            return ("method", _canon(obj.__func__, d, active), _canon(type(obj.__self__), d, active))
+        if isinstance(obj, (classmethod, staticmethod)):
+            return (type(obj).__name__, _canon(obj.__func__, d, active))
+        if isinstance(obj, property):
+            return ("property", _canon(obj.fget, d, active), _canon(obj.fset, d, active))
+        if isinstance(obj, functools.partial):
+            return ("partial", _canon(obj.func, d, active), _canon(obj.args, d, active), _canon(obj.keywords, d, active))
+        if isinstance(obj, types.CodeType):
+            return _canon_code(obj)
+        if isinstance(obj, dict):
+            return ("dict", frozenset((_canon(k, d, active), _canon(v, d, active)) for k, v in obj.items()))
+        if isinstance(obj, (list, tuple)):
+            return (type(obj).__name__, tuple(_canon(x, d, active) for x in obj))
+        if isinstance(obj, (set, frozenset)):
+            return ("set", frozenset(_canon(x, d, active) for x in obj))
+        if isinstance(obj, re.Pattern):
+            return ("re", obj.pattern, obj.flags)
+        state = getattr(obj, "__dict__", None)
+        if isinstance(state, dict):
+            return ("obj", type(obj).__module__, type(obj).__qualname__, _canon(state, d, active))
+        slots = []
+        for k in type(obj).__mro__:
+            for name in getattr(k, "__slots__", ()) or ():
+                if hasattr(obj, name):
+                    slots.append((name, _canon(getattr(obj, name), d, active)))
+        if slots:
+            return ("slots", type(obj).__qualname__, tuple(slots))
+        return ("other", type(obj).__module__, type(obj).__qualname__, repr(obj) if len(repr(obj)) < 200 else "")
+    finally:
+        active.discard(key)
+
+
+def _cell_ok(c):
+    try:
+        c.cell_contents
         return True
+    except ValueError:
+        return False
+
+
+def _canon_code(co):
+    import types
+
+    consts = tuple(_canon_code(c) if isinstance(c, types.CodeType) else ("c", type(c).__name__, repr(c)) for c in co.co_consts)
+    return ("code", co.co_code, consts, co.co_names, co.co_varnames, co.co_freevars, co.co_flags)
+
+
+def _is_function_like(v):
+    import types
+
+    if isinstance(v, (classmethod, staticmethod)):
+        v = v.__func__
+    if isinstance(v, property):
+        return True
+    return isinstance(v, types.FunctionType)
+
+
+def _module_classes(ns, modname, prefix=""):
+    out = {}
+    for name, val in list(ns.items()):
+        if isinstance(val, type) and val.__module__ == modname and val.__qualname__ == prefix + name:
+            out[val.__qualname__] = val
+            out.update(_module_classes(vars(val), modname, val.__qualname__ + "."))
+    return out
+
+
+def module_diff(modname, old_ns, new_ns):
+    """List what differs between the old and new module: (class qualname or
+    "", attribute, changed dict keys or None). Methods are left out: their
+    code is handled by line coverage. ("+", name) marks a class that exists
+    on one side only."""
+    out = []
+    oc, nc = _module_classes(old_ns, modname), _module_classes(new_ns, modname)
+    for q in set(oc) ^ set(nc):
+        out.append(("+", q, None))
+    scopes = [("", old_ns, new_ns)] + [(q, vars(oc[q]), vars(nc[q])) for q in oc if q in nc]
+    for q, ov, nv in scopes:
+        for name in set(ov) | set(nv):
+            if name in _SKIP_ATTRS or (not q and name.startswith("__") and name.endswith("__")):
+                continue
+            a, b = ov.get(name, _MISSING), nv.get(name, _MISSING)
+            if isinstance(a, type) or isinstance(b, type):
+                if isinstance(a, type) and isinstance(b, type) and a.__qualname__ == b.__qualname__:
+                    continue
+            if _is_function_like(a) and _is_function_like(b):
+                continue
+            if a is _MISSING or b is _MISSING:
+                if _is_function_like(b) and a is _MISSING:
+                    out.append((q, name, "method"))  # may now override a base method
+                    continue
+                if _is_function_like(a):
+                    continue  # removed method: callers ran its body (coverage)
+                out.append((q, name, None))
+                continue
+            if _canon(a) == _canon(b):
+                continue
+            keys = None
+            if isinstance(a, dict) and isinstance(b, dict):
+                ks = []
+                for k in set(a) | set(b):
+                    if k not in a or k not in b or _canon(a[k]) != _canon(b[k]):
+                        ks.append(k)
+                if ks and all(isinstance(k, type) for k in ks):
+                    keys = [(k.__module__, k.__qualname__) for k in ks]
+            out.append((q, name, keys))
+    return out
+
+
+_MISSING = object()
+
+
+def probe_module(modname, path, code, timeout=20.0):
+    """Run the patched module's top-level code in a forked child, against the
+    original versions of every other module, and compare what it defines
+    with the original module.
+
+    Returns (imports_ok, diff). diff is None when it could not be computed."""
+    if not hasattr(os, "fork") or not _load_sqlglot():
+        return True, None
+    import importlib
+    import pickle
+
+    try:
+        old_mod = importlib.import_module(modname)
+    except BaseException:
+        old_mod = None
+    r, w = os.pipe()
     try:
         pid = os.fork()
     except OSError:
-        return True
+        os.close(r)
+        os.close(w)
+        return True, None
     if pid == 0:  # child
         status = 1
         try:
+            os.close(r)
             fd = os.open(os.devnull, os.O_WRONLY)
             os.dup2(fd, 1)
             os.dup2(fd, 2)
-            import importlib
             import types
 
             pkg = modname.rpartition(".")[0]
@@ -787,23 +955,49 @@ def import_ok(modname, path, code, timeout=20.0):
             sys.modules[modname] = mod
             exec(code, mod.__dict__)
             status = 0
+            diff = None
+            if old_mod is not None:
+                try:
+                    diff = module_diff(modname, vars(old_mod), mod.__dict__)
+                except BaseException:
+                    diff = None
+            with os.fdopen(w, "wb") as f:
+                pickle.dump(diff, f)
         except BaseException:
             status = 1
         finally:
             os._exit(status)
+    os.close(w)
+    chunks = []
     deadline = time.monotonic() + timeout
+    import select as _select
+
     while True:
-        done, st = os.waitpid(pid, os.WNOHANG)
-        if done:
-            return os.waitstatus_to_exitcode(st) == 0
+        ready, _, _ = _select.select([r], [], [], 0.05)
+        if ready:
+            data = os.read(r, 1 << 16)
+            if data:
+                chunks.append(data)
+                continue
+            break  # end of file: child closed the pipe
         if time.monotonic() > deadline:
             try:
                 os.kill(pid, 9)
-                os.waitpid(pid, 0)
             except OSError:
                 pass
-            return False
-        time.sleep(0.005)
+            break
+    os.close(r)
+    try:
+        _, st = os.waitpid(pid, 0)
+        code_ok = os.waitstatus_to_exitcode(st) == 0
+    except OSError:
+        code_ok = False
+    if not code_ok:
+        return False, None
+    try:
+        return True, pickle.loads(b"".join(chunks)) if chunks else None
+    except Exception:
+        return True, None
 
 
 # ----------------------------------------------------------------------------
@@ -929,9 +1123,12 @@ class Selector:
             reasons.append("doc")
             sel |= self.doc_tests
         mod = module_of(path)
-        if ch.struct and path.startswith("sqlglot/") and not import_ok(mod, path, code):
-            reasons.append("import fails")
-            return set(self.import_failure(path)), reasons
+        probe_diff = None
+        if ch.struct and path.startswith("sqlglot/"):
+            ok_, probe_diff = probe_module(mod, path, code)
+            if not ok_:
+                reasons.append("import fails")
+                return set(self.import_failure(path)), reasons
         for ln in ch.func_lines:
             tests, flags = m.line_info(path, ln)
             sel |= tests
@@ -951,9 +1148,120 @@ class Selector:
                 for im in m.import_mods.get(f"{path}:{ln}", ["?"]):
                     reasons.append(f"import-time via {im}")
                     sel |= self.module_users(mod if im == "?" else im)
-        for scope, o, n, kind in ch.struct:
-            sel |= self.struct_users(path, mod, scope, o, n, kind, reasons)
+        dyn = None
+        if probe_diff is not None and self.dynamic_ok(ch.struct):
+            dyn = self.diff_users(mod, probe_diff, reasons)
+        if dyn is not None:
+            sel |= dyn
+        else:
+            for scope, o, n, kind in ch.struct:
+                sel |= self.struct_users(path, mod, scope, o, n, kind, reasons)
         return sel, reasons
+
+    # -- module-level changes seen by running the module ---------------------
+
+    @staticmethod
+    def dynamic_ok(struct):
+        """Use the run-time module diff only when every top-level change just
+        binds names (no calls with side effects, no assignments into other
+        objects, no conditional blocks)."""
+        for scope, o, n, kind in struct:
+            if kind == "classhead":
+                return False
+            for st in (o, n):
+                if st is None:
+                    continue
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
+                    continue
+                if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                    if all(isinstance(t, ast.Name) or (isinstance(t, ast.Tuple) and all(isinstance(e, ast.Name) for e in t.elts)) for t in targets):
+                        continue
+                return False
+        return True
+
+    def diff_users(self, mod, diff, reasons):
+        m = self.m
+        core = mod in m.core or mod == "sqlglot"
+        r = set()
+        for q, name, keys in diff:
+            if q == "+":
+                return None
+            cls_key = f"{mod}:{q}" if q else None
+            if core:
+                base = set(m.inst(cls_key)) if cls_key else set(self.all)
+            else:
+                base = set(self.module_users(mod))
+                if cls_key:
+                    base |= m.inst(cls_key)
+            if keys == "method":
+                reasons.append(f"new method {q}.{name}")
+                r |= base
+                continue
+            readers = self.runtime_readers(name, cls_key, mod, q)
+            u = base
+            if readers is not None:
+                u &= readers
+            if keys and all(km.startswith("sqlglot.expressions") for km, _ in keys):
+                ku = set()
+                for km, kq in keys:
+                    ku |= m.inst(f"{km}:{kq}")
+                u &= ku
+            reasons.append(f"diff {q or '<module>'}.{name}{' keys' if keys else ''}{' readers' if readers is not None else ''}")
+            r |= u
+        return r
+
+    def runtime_readers(self, name, cls_key, mod, qual):
+        """Tests that ran a line reading ``name`` while it mattered. None when
+        some read happens where we cannot follow it."""
+        m = self.m
+        ss = m.sites.get(name)
+        if not ss:
+            return None
+        r = set()
+        for site in ss:
+            f, line, kind = site[0], site[1], site[2]
+            owner = site[3] if len(site) > 3 else "s"
+            if kind:
+                # Reads at import inside the patched module itself were
+                # re-run in the child, so their results are in the diff.
+                if f == path_of_module(mod) or owner == "S":
+                    continue
+                if self.import_read_relevant(owner, cls_key, mod, qual):
+                    return None
+                continue
+            tests, flags = m.line_info(f, line)
+            if flags & 16:
+                return None  # read while building a per-process cache
+            if flags & 64 and not tests:
+                continue  # read by a class-creation hook: its output is in the diff
+            if flags & 1 and (cls_key is None or m.created_at_import(cls_key)):
+                if not tests or cls_key is None:
+                    return None
+            if not tests and flags & 10:
+                return None
+            r |= tests
+        return r
+
+    def import_read_relevant(self, owner, cls_key, mod, qual):
+        m = self.m
+        if owner.startswith("a:"):
+            base = owner[2:]
+            if cls_key is None:
+                return True  # module.attr at import: may be our module
+            found = False
+            for key, mro in m.class_info.items():
+                if key.rsplit(".", 1)[-1].split(":")[-1] == base:
+                    found = True
+                    if cls_key in mro:
+                        return True
+            return not found
+        if owner.startswith("n:"):
+            _, omod, oqual = owner.split(":", 2)
+            if cls_key is not None:
+                return omod == mod and oqual == qual
+            return omod == mod or omod in m.importers.get(mod, [])
+        return True
 
     def struct_users(self, path, mod, scope, o, n, kind, reasons):
         m = self.m
@@ -1017,7 +1325,7 @@ class Selector:
             ss = m.sites.get(name)
             if not ss:
                 return None
-            for f, line, kind in ss:
+            for f, line, kind, *_ in ss:
                 if kind:
                     return None
                 tests, flags = m.line_info(f, line)

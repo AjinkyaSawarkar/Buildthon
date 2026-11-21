@@ -25,7 +25,7 @@ for p in patches:
     cid = os.path.basename(p)[: -len(".patch")]
     if cid in results["commits"]:
         continue
-    work = f"/tmp/gt_work"
+    work = f"/tmp/gt_work_{os.getpid()}"
     shutil.rmtree(work, ignore_errors=True)
     shutil.copytree(src, work, ignore=shutil.ignore_patterns(".git", "__pycache__"), symlinks=True)
     r = subprocess.run(["git", "apply", "--unsafe-paths", os.path.abspath(p)], cwd=work, capture_output=True, text=True)
@@ -35,16 +35,16 @@ for p in patches:
             print(cid, "PATCH FAILED", r.stdout, r.stderr, file=sys.stderr)
             continue
     import glob
-    for g in glob.glob("/tmp/gt_out*"):
+    for g in glob.glob(f"/tmp/gt_out_{os.getpid()}*"):
         os.remove(g)
     env = {**os.environ, "SKIP_INTEGRATION": "0", "PYTHONPATH": work + ":" + os.path.dirname(os.path.abspath(__file__)),
-           "PYTHONDONTWRITEBYTECODE": "1", "GT_OUT": "/tmp/gt_out"}
+           "PYTHONDONTWRITEBYTECODE": "1", "GT_OUT": f"/tmp/gt_out_{os.getpid()}"}
     r = subprocess.run(
         [py, "-m", "pytest", "-q", "-n", "2", "-p", "no:cacheprovider", "-p", "gt_plugin", "--timeout", "120", "--tb=no"],
         cwd=work, capture_output=True, text=True, env=env,
     )
     failing = set()
-    for g in glob.glob("/tmp/gt_out*"):
+    for g in glob.glob(f"/tmp/gt_out_{os.getpid()}*"):
         for node in open(g).read().split("\n"):
             if not node:
                 continue

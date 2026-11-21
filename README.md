@@ -15,7 +15,8 @@ All of this is stored in `selector/map.json.gz`. When a patch arrives, the selec
 - **A Python file.** The selector builds the syntax tree of the file before and after the patch and compares them.
   - If only comments or blank lines changed, the trees are equal, so no test can fail and nothing is run.
   - If a line inside a function changed, the tests that ran that line are chosen.
-  - If a line at the top level of a class or module changed (for example a constant or a lookup table), the tests that use that class or module are chosen. When we can see every place that reads the changed name, we narrow this to the tests that ran one of those places. When the table is keyed by expression classes, we narrow it to the tests that created those expressions.
+  - If a line at the top level of a class or module changed (for example a constant or a lookup table), the selector runs the patched module's top-level code in a separate process and compares every class attribute and module name with the original. This shows exactly which names changed, including values that sqlglot computes from them when a class is created. For each changed name, it chooses the tests that use that class or module and that ran a line reading that name. When a changed table is keyed by expression classes, it keeps only the tests that created those expressions.
+  - If a patch only swaps `is None` for `== None` (or `is` for `==` with an enum member), the code behaves the same, so nothing is run.
   - If a docstring changed, the doc tests are chosen.
   - If the new file has a syntax error, or its top-level code fails when we run it, every test is chosen.
 - **A fixture or other data file.** The tests that opened that file are chosen.
@@ -40,8 +41,8 @@ With the starter kit's `Makefile`, `score.py` and `sample/` folder placed next t
 make sample
 ```
 
-On the 30 sample commits this selector scores about 127 simulated seconds with no misses. The starter that runs every test scores 1614 seconds.
+On the 30 sample commits this selector scores about 116 simulated seconds with no misses. The starter that runs every test scores 1614 seconds.
 
 ## How we checked it
 
-Besides the 30 sample commits, we made 113 more patches of our own (random one-line code changes, deleted lines, comment-only changes, fixture edits, test file edits, syntax errors, a new file, a README change, and others). For each one we ran sqlglot's full test suite to find the tests that really fail. The selector missed no failing test on any of them.
+Besides the 30 sample commits, we made more than 160 patches of our own (random one-line code changes, deleted lines, comment-only changes, fixture edits, test file edits, syntax errors, a new file, a README change, and others). For each one we ran sqlglot's full test suite to find the tests that really fail. The selector missed no failing test on any of them.
