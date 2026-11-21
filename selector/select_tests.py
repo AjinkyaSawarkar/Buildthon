@@ -921,10 +921,13 @@ def main():
         log(cid, len(chosen), "tests", why)
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
-    import resource
+    try:
+        import resource  # not on Windows
 
-    ch = resource.getrusage(resource.RUSAGE_CHILDREN)
-    log(f"cpu {time.process_time() - t0:.2f}s, children {ch.ru_utime + ch.ru_stime:.2f}s")
+        ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+        log(f"cpu {time.process_time() - t0:.2f}s, children {ch.ru_utime + ch.ru_stime:.2f}s")
+    except Exception:
+        log(f"cpu {time.process_time() - t0:.2f}s")
 
 
 if __name__ == "__main__":
