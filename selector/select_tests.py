@@ -222,6 +222,8 @@ class Map:
         self.test_ids = m.get("test_ids")
         self.import_mods = m.get("import_mods")  # None for old maps
         self.import_classes = m.get("import_classes", [])
+        self.vocab = m.get("vocab", {})
+        self.str_sites = m.get("str_sites", {})
         self._import_anc = None
         # Instantiated classes per ancestor: ancestor -> tests
         self._inst_cache = {}
@@ -759,7 +761,7 @@ def _load_sqlglot():
 _SKIP_ATTRS = {
     "__dict__", "__weakref__", "__module__", "__doc__", "__qualname__", "__firstlineno__",
     "__static_attributes__", "__annotations__", "__annotate__", "__annotate_func__",
-    "__annotations_cache__", "__orig_bases__", "__parameters__", "__slots__",
+    "__annotations_cache__", "__orig_bases__", "__parameters__", "__slots__", "_abc_impl",
 }
 
 
@@ -904,11 +906,45 @@ def module_diff(modname, old_ns, new_ns):
                         ks.append(k)
                 if ks and all(isinstance(k, type) for k in ks):
                     keys = [(k.__module__, k.__qualname__) for k in ks]
+                elif ks and all(isinstance(k, str) for k in ks):
+                    keys = ("str", sorted(ks))
+            elif isinstance(a, (set, frozenset, list, tuple)) and isinstance(b, (set, frozenset, list, tuple)):
+                try:
+                    sa, sb = set(a), set(b)
+                except TypeError:
+                    sa = sb = None
+                if sa is not None and sa != sb and all(isinstance(x, str) for x in sa ^ sb):
+                    keys = ("str", sorted(sa ^ sb))
             out.append((q, name, keys))
     return out
 
 
 _MISSING = object()
+_WORD_RE = None
+_ITER_RE = None
+_LINES = {}
+
+
+def _source_line(path, line):
+    lines = _LINES.get(path)
+    if lines is None:
+        try:
+            lines = open(os.path.join(SRC, path), encoding="utf-8").read().split("\n")
+        except OSError:
+            lines = []
+        _LINES[path] = lines
+    return lines[line - 1] if 0 < line <= len(lines) else ""
+
+
+def _init_res():
+    global _WORD_RE, _ITER_RE
+    import re
+
+    _WORD_RE = re.compile(r"[A-Za-z0-9_]+|[^A-Za-z0-9_\s]")
+    _ITER_RE = re.compile(r"\.(items|keys|values)\(|\bfor\b|\bin\b|\bsorted\(|\blist\(|\bset\(|\*\*")
+
+
+_init_res()
 
 
 def probe_module(modname, path, code, timeout=20.0):
@@ -1113,7 +1149,8 @@ class Selector:
             return set(self.import_failure(path)), reasons
         sel = set()
         # Tests that read this file as text see any change, comments included.
-        if old_src != new_src and path in m.textreads:
+        # (pytest itself reads every test file as text, so skip tests/.)
+        if old_src != new_src and path in m.textreads and not path.startswith("tests/"):
             sel |= m.s(m.textreads[path])
         touched = "\n".join(t for h in f["hunks"] for tag, t in h["lines"] if tag in "+-")
         ch = py_changes(old_src, new_src, module_of(path), touched, (old_t, new_t))
@@ -1150,7 +1187,12 @@ class Selector:
                     sel |= self.module_users(mod if im == "?" else im)
         dyn = None
         if probe_diff is not None and self.dynamic_ok(ch.struct):
-            dyn = self.diff_users(mod, probe_diff, reasons)
+            roots = set()
+            for scope, o, n, kind in ch.struct:
+                for nm in target_names(o) | target_names(n):
+                    roots.add((".".join(scope), nm))
+            # Word gating only when nothing else in the file changed.
+            dyn = self.diff_users(mod, probe_diff, reasons, roots if not ch.func_lines else ())
         if dyn is not None:
             sel |= dyn
         else:
@@ -1180,10 +1222,71 @@ class Selector:
                 return False
         return True
 
-    def diff_users(self, mod, diff, reasons):
+    def word_gate(self, mod, diff, roots):
+        """When every edited name is a table keyed by strings (keywords,
+        function names, format codes), the change can only matter to a test
+        whose SQL text, or own source code, contains one of those strings, or
+        to code that looks the key up by a fixed string, or walks the table.
+        Returns that set of tests, or None when this does not apply."""
+        m = self.m
+        if not m.vocab:
+            return None
+        root_items = [(q, name, keys) for q, name, keys in diff if (q, name) in roots]
+        if not root_items:
+            return None
+        words = set()
+        raw = set()
+        lexical_bases = (
+            "sqlglot.tokens:Tokenizer", "sqlglot.tokenizer_core:TokenizerCore",
+            "sqlglot.parser:Parser", "sqlglot.generator:Generator",
+            "sqlglot.dialects.dialect:Dialect",
+        )
+        for q, name, keys in root_items:
+            if not (isinstance(keys, tuple) and keys and keys[0] == "str"):
+                return None
+            # Only tables of dialect, tokenizer, parser and generator classes
+            # are keyed by SQL text. Other string-keyed tables (an
+            # expression's arg_types, settings) are not.
+            if q:
+                mro = m.class_info.get(f"{mod}:{q}", [])
+                if not any(b in mro for b in lexical_bases):
+                    return None
+            elif not mod.startswith(("sqlglot.dialects.", "sqlglot.parsers.", "sqlglot.generators.")):
+                return None
+            for k in keys[1]:
+                raw.add(k.upper())
+                for w in _WORD_RE.findall(k):
+                    words.add(w.upper())
+        if not words:
+            return None
+        g = set()
+        vocab = m.vocab
+        for w in words:
+            if len(w) == 1 and not w.isalnum():
+                hit = [w] if w in vocab else []
+            else:
+                hit = [v for v in vocab if w in v]
+            for v in hit:
+                g |= m.sets[vocab[v]]
+        for k in raw:
+            for f, line in m.str_sites.get(k, ()):
+                g |= m.line_info(f, line)[0]
+        for q, name, keys in root_items:
+            for site in m.sites.get(name, ()):
+                if site[2]:
+                    continue
+                text = _source_line(site[0], site[1])
+                if _ITER_RE.search(text):
+                    g |= m.line_info(site[0], site[1])[0]
+        return g
+
+    def diff_users(self, mod, diff, reasons, roots=()):
         m = self.m
         core = mod in m.core or mod == "sqlglot"
         r = set()
+        gate = self.word_gate(mod, diff, set(roots)) if roots else None
+        if gate is not None:
+            reasons.append(f"word gate {len(gate)}")
         for q, name, keys in diff:
             if q == "+":
                 return None
@@ -1202,7 +1305,9 @@ class Selector:
             u = base
             if readers is not None:
                 u &= readers
-            if keys and all(km.startswith("sqlglot.expressions") for km, _ in keys):
+            if gate is not None:
+                u &= gate
+            if keys and not isinstance(keys, tuple) and all(km.startswith("sqlglot.expressions") for km, _ in keys):
                 ku = set()
                 for km, kq in keys:
                     ku |= m.inst(f"{km}:{kq}")

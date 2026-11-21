@@ -101,7 +101,7 @@ def _child_start():
         cov.stop()
         cov.save()
         with open(os.path.join(OUT, f"extra.{os.getpid()}.pkl"), "wb") as f:
-            pickle.dump({"opens": _opens, "classes": _classes}, f)
+            pickle.dump({"opens": _opens, "classes": _classes, "words": _words}, f)
 
     multiprocessing.util.Finalize(None, _save, exitpriority=100)
     _child["cov"] = cov
@@ -292,6 +292,44 @@ def _wrap_all():
 
     for cls in (Expr, Generator, Parser, TokenizerCore, Dialect):
         _wrap_init(cls)
+    from sqlglot.tokens import Tokenizer
+
+    _wrap_text(Tokenizer, "tokenize", arg=True)
+    _wrap_text(TokenizerCore, "tokenize", arg=True)
+    _wrap_text(Generator, "generate", arg=False)
+
+
+_WORD = None
+_words = {}  # ctx -> set of upper-case words seen in SQL text
+
+
+def _record_text(text):
+    global _WORD
+    if _WORD is None:
+        import re
+
+        _WORD = re.compile(r"[A-Za-z0-9_]+|[^A-Za-z0-9_\s]")
+    if isinstance(text, str) and len(text) < 200_000:
+        _words.setdefault(_state["ctx"], set()).update(w.upper() for w in _WORD.findall(text))
+
+
+def _wrap_text(cls, name, arg):
+    """Record the words of every SQL string tokenized (input) or generated
+    (output) while each test runs."""
+    original = cls.__dict__.get(name)
+    if original is None:
+        return
+
+    def wrapper(self, *args, **kwargs):
+        if arg and args:
+            _record_text(args[0])
+        result = original(self, *args, **kwargs)
+        if not arg:
+            _record_text(result)
+        return result
+
+    wrapper.__wrapped__ = original
+    setattr(cls, name, wrapper)
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -335,4 +373,4 @@ def pytest_unconfigure(config):
     _cov.stop()
     _cov.save()
     with open(os.path.join(OUT, f"extra.{os.getpid()}.pkl"), "wb") as f:
-        pickle.dump({"opens": _opens, "classes": _classes}, f)
+        pickle.dump({"opens": _opens, "classes": _classes, "words": _words}, f)

@@ -89,6 +89,7 @@ for path in glob.glob(os.path.join(trace_dir, "cov.*")):
 
 opens, textreads, classes = {}, {}, {}
 import_classes = set()
+vocab = {}  # upper-case word -> tests whose SQL text (in or out) had it
 for path in glob.glob(os.path.join(trace_dir, "extra.*.pkl")):
     d = pickle.load(open(path, "rb"))
     for ctx, items in d["opens"].items():
@@ -97,6 +98,12 @@ for path in glob.glob(os.path.join(trace_dir, "extra.*.pkl")):
             opens.setdefault(rel, set()).update(s)
             if rel.endswith(".py") and "b" not in mode:
                 textreads.setdefault(rel, set()).update(s)
+    for ctx, items in d.get("words", {}).items():
+        s, _ = expand(ctx)
+        if not s:
+            continue
+        for w in items:
+            vocab.setdefault(w, set()).update(s)
     for ctx, items in d["classes"].items():
         if ctx.startswith("import") or ctx.startswith("meta:"):
             import_classes.update(items)
@@ -326,6 +333,52 @@ for rel, tree in py_sources.items():
     for st in tree.body:
         visit(st, rel, False)
 
+import re as _re  # noqa: E402
+
+_WORDS = _re.compile(r"[A-Za-z0-9_]+|[^A-Za-z0-9_\s]")
+by_id = {t["id"]: t["number"] for t in tests}
+for t in tests:
+    parts = t["id"].split("::")
+    tree = py_sources.get(parts[0])
+    if tree is None or len(parts) < 2:
+        continue
+    node = tree
+    for name in parts[1:]:
+        found = None
+        for st in getattr(node, "body", []):
+            if isinstance(st, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and st.name == name:
+                found = st
+                break
+        node = found
+        if node is None:
+            break
+    if node is None:
+        continue
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and len(sub.value) < 100_000:
+            for w in _WORDS.findall(sub.value):
+                vocab.setdefault(w.upper(), set()).add(t["number"])
+
+# Upper-cased string constants inside sqlglot functions: code that looks a
+# table up by a fixed key.
+str_sites = {}
+
+
+def _str_visit(node, rel, in_func):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        for ch in ast.iter_child_nodes(node):
+            _str_visit(ch, rel, True)
+        return
+    if in_func and isinstance(node, ast.Constant) and isinstance(node.value, str) and 0 < len(node.value) <= 60:
+        str_sites.setdefault(node.value.upper(), set()).add((rel, node.lineno))
+    for ch in ast.iter_child_nodes(node):
+        _str_visit(ch, rel, in_func)
+
+
+for rel, tree in py_sources.items():
+    if rel.startswith("sqlglot"):
+        _str_visit(tree, rel, False)
+
 sets, index = [], {}
 
 
@@ -358,6 +411,8 @@ result = {
     "sites": {k: sorted(v) for k, v in sites.items()},
     "import_mods": {f"{f}:{ln}": sorted(v) for (f, ln), v in import_mods.items()},
     "import_classes": sorted(import_classes),
+    "vocab": {w: sid(s) for w, s in vocab.items()},
+    "str_sites": {k: sorted(v) for k, v in str_sites.items()},
 }
 with gzip.open(out, "wt", encoding="utf-8") as f:
     json.dump(result, f, separators=(",", ":"))
