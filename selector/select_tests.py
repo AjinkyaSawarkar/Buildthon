@@ -1052,6 +1052,7 @@ class Selector:
             t["number"] for t in tests if t["file"] in ("tests/test_docs.py",)
         )
         self._mod_users = {}
+        self.hedge = set()
 
     # -- users of modules and classes ----------------------------------------
 
@@ -1169,6 +1170,8 @@ class Selector:
         for ln in ch.func_lines:
             tests, flags = m.line_info(path, ln)
             sel |= tests
+            for near in (ln - 2, ln - 1, ln + 1, ln + 2):
+                self.hedge |= m.line_info(path, near)[0]
             if m.import_mods is None:
                 if flags & 17 or (flags & 10 and not tests):
                     reasons.append(f"importline {ln}")
@@ -1302,7 +1305,8 @@ class Selector:
                 r |= base
                 continue
             readers = self.runtime_readers(name, cls_key, mod, q)
-            u = base
+            self.hedge |= base
+            u = set(base)
             if readers is not None:
                 u &= readers
             if gate is not None:
@@ -1401,6 +1405,7 @@ class Selector:
         if keys:
             reasons.append(f"exp keys {sorted(keys)} in {mod}:{qual}")
             base = self.module_users(mod) if not qual else (set(m.inst(f"{mod}:{qual}")) | self.module_users(mod))
+            self.hedge |= base
             return set(base) & self.expression_users(keys)
         readers = self.name_readers(o, n, f"{mod}:{qual}" if qual else None)
         if qual:
@@ -1410,6 +1415,7 @@ class Selector:
             r = set(self.module_users(mod))
         if readers is not None:
             reasons.append(f"readers of {sorted(target_names(o) | target_names(n))} in {mod}:{qual}")
+            self.hedge |= r
             return r & readers
         reasons.append(f"class {qual}" if qual else f"module {mod}")
         return r
@@ -1488,6 +1494,7 @@ class Selector:
         files = parse_patch(patch_text)
         sel = set()
         reasons = []
+        self.hedge = set()
         if not files and patch_text.strip():
             return set(self.all), ["unparsed"]
         for f in files:
@@ -1502,6 +1509,26 @@ class Selector:
 
 # ----------------------------------------------------------------------------
 # Splitting over workers
+
+
+def pack_slack(workers, ms, extra):
+    """Put extra tests into idle worker time without raising the busiest
+    worker's load or the worker count, so the cost does not change. These
+    are tests near the change that our rules left out: free insurance."""
+    if not workers or not extra:
+        return workers
+    loads = [sum(ms[n] for n in w) for w in workers]
+    cap = max(loads)
+    for num in sorted(extra, key=lambda n: (ms[n], n)):
+        best = None
+        for i, load in enumerate(loads):
+            if load + ms[num] <= cap and (best is None or loads[i] < loads[best]):
+                best = i
+        if best is None:
+            continue
+        workers[best].append(num)
+        loads[best] += ms[num]
+    return workers
 
 
 def split(tests_ms):
@@ -1563,10 +1590,17 @@ def main():
                 chosen, why = sel.select(text)
         except Exception as e:
             chosen, why, in_map_numbers = set(ms), [f"error {e}"], False
+        sel_map_chosen = set(chosen)
         if to_data is not None and in_map_numbers:
             chosen = {to_data[n] for n in chosen if n in to_data} | (unknown if chosen else set())
         chosen = sorted(n for n in chosen if n in ms)
         workers = split([(n, ms[n]) for n in chosen])
+        if workers and sel is not None and in_map_numbers:
+            extra = set(sel.hedge) - set(sel_map_chosen)
+            if to_data is not None:
+                extra = {to_data[n] for n in extra if n in to_data}
+            extra = {n for n in extra if n in ms} - set(chosen)
+            workers = pack_slack(workers, ms, extra)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         log(cid, len(chosen), "tests", why)
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
