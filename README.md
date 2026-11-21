@@ -40,7 +40,7 @@ With the starter kit's `Makefile`, `score.py` and `sample/` folder placed next t
 make sample
 ```
 
-On the 30 sample commits this selector scores about 177.5 simulated seconds with no misses. The starter that runs every test scores 1614 seconds.
+On the 30 sample commits this selector scores about 127 simulated seconds with no misses. The starter that runs every test scores 1614 seconds.
 
 ## How we checked it
 

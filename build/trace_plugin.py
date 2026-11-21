@@ -90,8 +90,10 @@ def _child_start():
         config_file=False,
     )
     cov.start()
-    cov.switch_context("import")
-    _import_everything()
+    cov.switch_context("import:?")
+    _ImportTracker(cov).run(_import_core)
+    _wrap_all()
+    _import_everything(cov)
     sys.addaudithook(_audit)
     _wrap_all()
 
@@ -148,7 +150,50 @@ def _patch_pools():
     cfp.ProcessPoolExecutor.submit = submit
 
 
-def _import_everything():
+class _ImportTracker:
+    """While modules import, name the coverage context after the module whose
+    top-level code is running ("import:<module>"), or "meta:<module>" while a
+    class-creation hook (metaclass __new__, __init_subclass__) runs."""
+
+    def __init__(self, cov):
+        self.cov = cov
+        self.stack = []  # (frame, ctx)
+
+    def _switch(self, ctx):
+        _state["ctx"] = ctx
+        self.cov.switch_context(ctx)
+
+    def __call__(self, frame, event, arg):
+        if event == "call":
+            co = frame.f_code
+            ctx = None
+            if co.co_name == "<module>":
+                name = frame.f_globals.get("__name__", "?")
+                ctx = "import:" + name
+            elif co.co_name in ("__init_subclass__", "__new__") and "sqlglot" in co.co_filename:
+                first = frame.f_locals.get(co.co_varnames[0]) if co.co_argcount else None
+                if co.co_name == "__init_subclass__" or (isinstance(first, type) and issubclass(first, type)):
+                    mod = self.stack[-1][1].split(":", 1)[1] if self.stack else "?"
+                    ctx = "meta:" + mod
+            if ctx is not None:
+                self.stack.append((frame, ctx))
+                self._switch(ctx)
+        elif event == "return" and self.stack and self.stack[-1][0] is frame:
+            self.stack.pop()
+            self._switch(self.stack[-1][1] if self.stack else "import:?")
+
+    def run(self, fn):
+        sys.setprofile(self)
+        try:
+            fn()
+        finally:
+            sys.setprofile(None)
+
+
+def _import_everything(cov=None):
+    if cov is not None:
+        return _ImportTracker(cov).run(_import_everything)
+
     import importlib
     import pkgutil
 
@@ -179,8 +224,10 @@ def pytest_configure(config):
         config_file=False,
     )
     _cov.start()
-    _set("import")
-    _import_everything()
+    _set("import:?")
+    _ImportTracker(_cov).run(_import_core)
+    _wrap_all()
+    _import_everything(_cov)
     _patch_pools()
     import sqlglot
     from sqlglot.dialects import DIALECTS
@@ -191,7 +238,6 @@ def pytest_configure(config):
     for ctx in ("warmup", "warmup2"):
         _set(ctx)
         _warmup(sqlglot, DIALECTS, Dialect)
-    _wrap_all()
     _set("collect:?")
 
 
@@ -227,7 +273,17 @@ def _warmup(sqlglot, DIALECTS, Dialect):
         pass
 
 
+def _import_core():
+    import sqlglot  # noqa: F401
+
+
+_wrapped = {"done": False}
+
+
 def _wrap_all():
+    if _wrapped["done"]:
+        return
+    _wrapped["done"] = True
     from sqlglot.dialects.dialect import Dialect
     from sqlglot.expressions.core import Expr
     from sqlglot.generator import Generator

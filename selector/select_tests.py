@@ -130,10 +130,11 @@ def parse_patch(text):
     return files
 
 
-def apply_hunks(old_text, hunks):
+def apply_hunks(old_text, hunks, want_touched=False):
     """Apply hunks to old_text. Returns new text and list of old line numbers
     touched (1-based, removed lines) plus insertion points."""
     old_lines = old_text.split("\n")
+    old_t, new_t = set(), set()
     out = []
     pos = 0  # index into old_lines
     offset = 0
@@ -157,11 +158,23 @@ def apply_hunks(old_text, hunks):
         if start < pos:
             raise PatchError("overlapping hunks")
         out.extend(old_lines[pos:start])
+        o = start  # 0-based index of the next old line
         for tag, t in h["lines"]:
-            if tag in " +":
+            if tag == " ":
                 out.append(t)
+                o += 1
+            elif tag == "-":
+                old_t.add(o + 1)
+                new_t.update((len(out), len(out) + 1))
+                o += 1
+            else:
+                out.append(t)
+                new_t.add(len(out))
+                old_t.update((o, o + 1))
         pos = start + len(old_chunk)
     out.extend(old_lines[pos:])
+    if want_touched:
+        return "\n".join(out), old_t, new_t
     return "\n".join(out)
 
 
@@ -207,6 +220,9 @@ class Map:
         self.importers = m["importers"]
         self.sites = m.get("sites", {})
         self.test_ids = m.get("test_ids")
+        self.import_mods = m.get("import_mods")  # None for old maps
+        self.import_classes = m.get("import_classes", [])
+        self._import_anc = None
         # Instantiated classes per ancestor: ancestor -> tests
         self._inst_cache = {}
         self.desc = {}
@@ -214,6 +230,16 @@ class Map:
             for anc in self.mro.get(name, [name]):
                 self.desc.setdefault(anc, []).append(sidx)
         self._users_cache = {}
+
+    def created_at_import(self, cls_key):
+        """Was an instance of cls_key (or a subclass) created while modules
+        were importing?"""
+        if self._import_anc is None:
+            anc = set()
+            for c in self.import_classes:
+                anc.update(self.mro.get(c, [c]))
+            self._import_anc = anc
+        return cls_key in self._import_anc
 
     def s(self, idx):
         return self.sets[idx]
@@ -259,8 +285,27 @@ def path_of_module(mod):
 # Syntax tree comparison
 
 
+_FP = {}
+
+
 def dump(node):
-    return ast.dump(node, annotate_fields=True, include_attributes=False)
+    """Structural fingerprint of a syntax tree (positions ignored). Memoized
+    per node object, so comparing nested statements stays cheap."""
+    key = id(node)
+    r = _FP.get(key)
+    if r is not None and r[0] is node:
+        return r[1]
+    parts = [type(node).__name__]
+    for name, value in ast.iter_fields(node):
+        if isinstance(value, ast.AST):
+            parts.append(dump(value))
+        elif isinstance(value, list):
+            parts.append(tuple(dump(v) if isinstance(v, ast.AST) else repr(v) for v in value))
+        else:
+            parts.append(repr(value))
+    h = hash(tuple(parts))
+    _FP[key] = (node, h)
+    return h
 
 
 def is_docstring(stmt):
@@ -271,11 +316,63 @@ def is_docstring(stmt):
     )
 
 
-def stmt_key(s):
+class _Ctx:
+    """Per-file state: source lines and which lines the patch touched, on
+    each side. A statement whose lines were not touched has the same text on
+    both sides, so it can be matched by text without walking its tree."""
+
+    old_lines = new_lines = ()
+    old_touched = new_touched = frozenset()
+    norm = None
+    sides = {}  # id(node) -> "old" / "new"
+
+
+CTX = _Ctx()
+
+
+def _span(s):
+    start = s.lineno
+    for d in getattr(s, "decorator_list", ()) or ():
+        start = min(start, d.lineno)
+    return start, getattr(s, "end_lineno", None) or s.lineno
+
+
+def untouched_text(s, side):
+    """The statement's source text when the patch did not touch it, else None."""
+    touched = CTX.old_touched if side == "old" else CTX.new_touched
+    lines = CTX.old_lines if side == "old" else CTX.new_lines
+    a, b = _span(s)
+    for ln in range(a, b + 1):
+        if ln in touched:
+            return None
+    return "\n".join(lines[a - 1 : b])
+
+
+def same_text(a, b):
+    """a is an old statement, b a new one."""
+    ta = untouched_text(a, "old")
+    return ta is not None and ta == untouched_text(b, "new")
+
+
+def norm_equal(a, b):
+    """True when a and b only differ by is/== swaps that cannot matter."""
+    if CTX.norm is None or a is None or b is None:
+        return False
+    import copy
+
+    ca = CTX.norm.visit(copy.deepcopy(a))
+    cb = CTX.norm.visit(copy.deepcopy(b))
+    return dump(ca) == dump(cb)
+
+
+def stmt_key(s, side="old"):
     if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return ("def", s.name)
     if isinstance(s, ast.ClassDef):
         return ("class", s.name)
+    t = untouched_text(s, side)
+    if t is not None:
+        return ("stmt", "text", hash(t))
     return ("stmt", dump(s))
 
 
@@ -326,7 +423,7 @@ def exp_key_diff(o, n):
     def entries(d):
         res = {}
         for k, v in zip(d.keys, d.values):
-            kk = "**" + dump(v) if k is None else dump(k)
+            kk = ("**", dump(v)) if k is None else dump(k)
             res[kk] = (k, dump(v))
         return res
 
@@ -361,22 +458,40 @@ def header_lines(s):
     return stmt_lines(s)
 
 
-def compare_body(ob, nb, ch, in_func, scope, parent):
-    """Compare two statement lists. ``parent`` is the old enclosing statement."""
-    ok = [stmt_key(s) for s in ob]
-    nk = [stmt_key(s) for s in nb]
+def compare_body(ob, nb, ch, in_func, scope, parent, use_text=True, outer_near=()):
+    """Compare two statement lists. ``parent`` is the old enclosing statement.
+
+    First pass matches untouched statements by their text (cheap). Blocks
+    that differ are compared again by syntax tree, so a statement next to a
+    deleted line is not mistaken for a changed one."""
+    if use_text:
+        ok = [stmt_key(s) for s in ob]
+        nk = [stmt_key(s, "new") for s in nb]
+    else:
+        ok = [stmt_key_tree(s) for s in ob]
+        nk = [stmt_key_tree(s) for s in nb]
     sm = difflib.SequenceMatcher(a=ok, b=nk, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             for idx, (a, b) in enumerate(zip(ob[i1:i2], nb[j1:j2])):
-                if ok[i1 + idx][0] != "stmt":
+                if ok[i1 + idx][0] != "stmt" and not same_text(a, b):
                     compare_stmt(a, b, ch, in_func, scope)
             continue
         olds, news = ob[i1:i2], nb[j1:j2]
+        near = []
+        if i1 > 0:
+            near.append(ob[i1 - 1])
+        if i2 < len(ob):
+            near.append(ob[i2])
+        if not near:
+            near = list(outer_near)
+        if use_text and olds and news:
+            compare_body(olds, news, ch, in_func, scope, parent, use_text=False, outer_near=near)
+            continue
         # Pair statements of the same type position by position.
         if tag == "replace" and len(olds) == len(news):
             pairs_ok = all(
-                type(a) is type(b) and (stmt_key(a)[0] == "stmt" or stmt_key(a) == stmt_key(b))
+                type(a) is type(b) and (stmt_key_tree(a)[0] == "stmt" or stmt_key_tree(a) == stmt_key_tree(b))
                 for a, b in zip(olds, news)
             )
             if pairs_ok:
@@ -388,22 +503,37 @@ def compare_body(ob, nb, ch, in_func, scope, parent):
         for b in news:
             if in_func:
                 # An inserted statement runs when its neighbours run.
-                near = []
-                if i1 > 0:
-                    near.append(ob[i1 - 1])
-                if i1 < len(ob):
-                    near.append(ob[i1])
-                if near:
-                    for s in near:
-                        ch.func_lines.update(header_lines(s))
+                if olds:
+                    for s_ in olds:
+                        ch.func_lines.update(header_lines(s_))
+                elif near:
+                    for s_ in near:
+                        ch.func_lines.update(header_lines(s_))
                 elif parent is not None:
                     ch.func_lines.update(header_lines(parent))
             else:
                 changed_stmt(None, b, ch, in_func, scope)
 
 
+def stmt_key_tree(s):
+    if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return ("def", s.name)
+    if isinstance(s, ast.ClassDef):
+        return ("class", s.name)
+    return ("stmt", dump(s))
+
+
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+_COMPOUND = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.If, ast.While, ast.For,
+    ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try,
+)
+
+
 def compare_stmt(o, n, ch, in_func, scope):
-    if dump(o) == dump(n):
+    if same_text(o, n):
+        return
+    if (not isinstance(o, _COMPOUND) or not (in_func or isinstance(o, _DEFS))) and dump(o) == dump(n):
         return
     if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
         ohead = [dump(x) for x in o.decorator_list] + [dump(o.args), dump(o.returns) if o.returns else ""]
@@ -451,7 +581,7 @@ def compare_stmt(o, n, ch, in_func, scope):
         return
     # Inside a function: descend into compound statements.
     if isinstance(o, (ast.If, ast.While)):
-        if dump(o.test) != dump(n.test):
+        if dump(o.test) != dump(n.test) and not norm_equal(o.test, n.test):
             ch.func_lines.update(range(o.lineno, o.test.end_lineno + 1))
         compare_body(o.body, n.body, ch, True, scope, o)
         compare_body(o.orelse, n.orelse, ch, True, scope, o)
@@ -480,6 +610,8 @@ def compare_stmt(o, n, ch, in_func, scope):
 
 
 def changed_stmt(o, n, ch, in_func, scope):
+    if o is not None and n is not None and norm_equal(o, n):
+        return
     if in_func:
         if o is not None:
             ch.func_lines.update(stmt_lines(o))
@@ -499,7 +631,71 @@ def changed_stmt(o, n, ch, in_func, scope):
     ch.struct.append((scope, o, n, "stmt"))
 
 
-def py_changes(old_src, new_src):
+class _IdentityCompare(ast.NodeTransformer):
+    """Rewrite ``a is X`` as ``a == X`` (and ``is not`` as ``!=``) when X is
+    None or an enum member. Both spellings give the same answer for these
+    values, so a patch that only swaps one for the other changes nothing."""
+
+    def __init__(self, modname):
+        self.modname = modname
+        self._mod = None
+        self._tried = False
+
+    def _module(self):
+        if not self._tried:
+            self._tried = True
+            if self.modname.startswith("sqlglot") and _load_sqlglot():
+                try:
+                    import importlib
+
+                    self._mod = importlib.import_module(self.modname)
+                except BaseException:
+                    self._mod = None
+        return self._mod
+
+    def _safe(self, node):
+        if isinstance(node, ast.Constant) and node.value is None:
+            return True
+        if not isinstance(node, ast.Attribute):
+            return False
+        chain = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            chain.append(cur.attr)
+            cur = cur.value
+        if not isinstance(cur, ast.Name):
+            return False
+        mod = self._module()
+        if mod is None:
+            return False
+        import enum
+
+        obj = getattr(mod, cur.id, None)
+        if obj is None:
+            return False
+        try:
+            for a in reversed(chain):
+                obj = getattr(obj, a)
+        except Exception:
+            return False
+        # Plain enums and str-valued AutoName enums; never int-like enums.
+        return isinstance(obj, enum.Enum) and not isinstance(obj, (int, float))
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        left = node.left
+        ops = []
+        for op, right in zip(node.ops, node.comparators):
+            if isinstance(op, (ast.Is, ast.IsNot)) and (self._safe(right) or self._safe(left)):
+                op = ast.Eq() if isinstance(op, ast.Is) else ast.NotEq()
+            ops.append(op)
+            left = right
+        node.ops = ops
+        return node
+
+
+def py_changes(old_src, new_src, modname="", touched_text=None, touched_lines=None):
+    _FP.clear()
     ch = Changes()
     try:
         ot = ast.parse(old_src)
@@ -507,6 +703,26 @@ def py_changes(old_src, new_src):
         ch.whole = True
         return ch
     nt = ast.parse(new_src)  # SyntaxError handled by caller
+    gate = touched_text is None or any(
+        k in touched_text for k in (" is ", "==", "!=", " is\n")
+    )
+    CTX.norm = _IdentityCompare(modname) if gate else None
+    CTX.old_lines = old_src.split("\n")
+    CTX.new_lines = new_src.split("\n")
+    if touched_lines is None:
+        ot_, nt_ = set(), set()
+        sm = difflib.SequenceMatcher(None, CTX.old_lines, CTX.new_lines, autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                continue
+            ot_.update(range(i1 + 1, i2 + 1))
+            nt_.update(range(j1 + 1, j2 + 1))
+            if i1 == i2:
+                ot_.update((i1, i1 + 1))
+            if j1 == j2:
+                nt_.update((j1, j1 + 1))
+        touched_lines = (ot_, nt_)
+    CTX.old_touched, CTX.new_touched = frozenset(touched_lines[0]), frozenset(touched_lines[1])
     ob, nb = ot.body, nt.body
     if ob and nb and is_docstring(ob[0]) and is_docstring(nb[0]):
         if dump(ob[0]) != dump(nb[0]):
@@ -693,7 +909,7 @@ class Selector:
         if new is None:
             reasons.append("deleted module")
             return set(self.import_failure(path)), reasons
-        new_src = apply_hunks(old_src, f["hunks"])
+        new_src, old_t, new_t = apply_hunks(old_src, f["hunks"], want_touched=True)
         if os.path.basename(path) == "conftest.py":
             return set(self.all), reasons + ["conftest"]
         try:
@@ -705,7 +921,8 @@ class Selector:
         # Tests that read this file as text see any change, comments included.
         if old_src != new_src and path in m.textreads:
             sel |= m.s(m.textreads[path])
-        ch = py_changes(old_src, new_src)
+        touched = "\n".join(t for h in f["hunks"] for tag, t in h["lines"] if tag in "+-")
+        ch = py_changes(old_src, new_src, module_of(path), touched, (old_t, new_t))
         if ch.whole:
             return set(self.module_users(module_of(path))), reasons + ["whole"]
         if ch.doc:
@@ -718,10 +935,22 @@ class Selector:
         for ln in ch.func_lines:
             tests, flags = m.line_info(path, ln)
             sel |= tests
-            if flags & 17 or (flags & 10 and not tests):
-                # Ran only at import or warmup (caches, factories): every user.
+            if m.import_mods is None:
+                if flags & 17 or (flags & 10 and not tests):
+                    reasons.append(f"importline {ln}")
+                    sel |= self.module_users(mod)
+                continue
+            if flags & 80 or (flags & 10 and not tests):
+                # Class-creation hooks, once-per-process caches, or code no
+                # test ran directly: everyone who uses this module.
                 reasons.append(f"importline {ln}")
                 sel |= self.module_users(mod)
+            elif flags & 1:
+                # Ran while some module's top-level code ran (a constant built
+                # at import): the users of that module.
+                for im in m.import_mods.get(f"{path}:{ln}", ["?"]):
+                    reasons.append(f"import-time via {im}")
+                    sel |= self.module_users(mod if im == "?" else im)
         for scope, o, n, kind in ch.struct:
             sel |= self.struct_users(path, mod, scope, o, n, kind, reasons)
         return sel, reasons
@@ -760,7 +989,7 @@ class Selector:
             reasons.append(f"exp keys {sorted(keys)} in {mod}:{qual}")
             base = self.module_users(mod) if not qual else (set(m.inst(f"{mod}:{qual}")) | self.module_users(mod))
             return set(base) & self.expression_users(keys)
-        readers = self.name_readers(o, n)
+        readers = self.name_readers(o, n, f"{mod}:{qual}" if qual else None)
         if qual:
             r = set(m.inst(f"{mod}:{qual}"))
             r |= self.module_users(mod)
@@ -772,7 +1001,7 @@ class Selector:
         reasons.append(f"class {qual}" if qual else f"module {mod}")
         return r
 
-    def name_readers(self, o, n):
+    def name_readers(self, o, n, cls_key=None):
         """Tests that read a changed module/class-level name, when every read
         happens inside a function that tests run. None when we cannot tell."""
         ok_types = (ast.Assign, ast.AnnAssign, ast.AugAssign)
@@ -792,8 +1021,16 @@ class Selector:
                 if kind:
                     return None
                 tests, flags = m.line_info(f, line)
-                if flags & 17 or (not tests and flags & 10):
+                if m.import_mods is None:
+                    if flags & 17 or (not tests and flags & 10):
+                        return None
+                elif flags & 80 or (not tests and flags & 10):
                     return None
+                elif flags & 1:
+                    # Read while modules imported. That matters only if an
+                    # instance of the changed class existed then.
+                    if cls_key is None or m.created_at_import(cls_key):
+                        return None
                 r |= tests
         return r
 

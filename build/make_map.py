@@ -52,8 +52,10 @@ def expand(ctx):
     if ctx.startswith("collect:"):
         f = ctx[len("collect:") :]
         return set(file_tests.get(f, set())), 4
-    if ctx == "import":
+    if ctx == "import" or ctx.startswith("import:"):
         return set(), 1
+    if ctx.startswith("meta:"):
+        return set(), 64
     if ctx == "warmup":
         return set(), 2
     if ctx == "warmup2":
@@ -66,6 +68,7 @@ def expand(ctx):
 from coverage import CoverageData  # noqa: E402
 
 lines = {}  # file -> line -> [set, flags]
+import_mods = {}  # (file, line) -> modules whose top-level code ran the line
 for path in glob.glob(os.path.join(trace_dir, "cov.*")):
     data = CoverageData(basename=path)
     data.read()
@@ -76,6 +79,8 @@ for path in glob.glob(os.path.join(trace_dir, "cov.*")):
         for ln, ctxs in data.contexts_by_lineno(f).items():
             entry = per.setdefault(ln, [set(), 0])
             for c in ctxs:
+                if c.startswith("import:"):
+                    import_mods.setdefault((rel, ln), set()).add(c[len("import:"):])
                 if c not in cache:
                     cache[c] = expand(c)
                 s, fl = cache[c]
@@ -83,6 +88,7 @@ for path in glob.glob(os.path.join(trace_dir, "cov.*")):
                 entry[1] |= fl
 
 opens, textreads, classes = {}, {}, {}
+import_classes = set()
 for path in glob.glob(os.path.join(trace_dir, "extra.*.pkl")):
     d = pickle.load(open(path, "rb"))
     for ctx, items in d["opens"].items():
@@ -92,6 +98,8 @@ for path in glob.glob(os.path.join(trace_dir, "extra.*.pkl")):
             if rel.endswith(".py") and "b" not in mode:
                 textreads.setdefault(rel, set()).update(s)
     for ctx, items in d["classes"].items():
+        if ctx.startswith("import") or ctx.startswith("meta:"):
+            import_classes.update(items)
         s, _ = expand(ctx)
         for name in items:
             classes.setdefault(name, set()).update(s)
@@ -329,6 +337,8 @@ result = {
     "core": sorted(core),
     "importers": {k: sorted(v) for k, v in importers.items()},
     "sites": {k: sorted(v) for k, v in sites.items()},
+    "import_mods": {f"{f}:{ln}": sorted(v) for (f, ln), v in import_mods.items()},
+    "import_classes": sorted(import_classes),
 }
 with gzip.open(out, "wt", encoding="utf-8") as f:
     json.dump(result, f, separators=(",", ":"))
