@@ -242,6 +242,9 @@ class Map:
         self.lazy_importers = m.get("lazy_importers", {})
         self.dyn_import_sites = m.get("dyn_import_sites", [])
         self.guards = m.get("guards", {})
+        self.setup_users = m.get("setup_users", {})
+        self.call_opens = m.get("call_opens", {})
+        self.tok_texts = m.get("tok_texts", {})
         # Importing a.b.c first runs package a.b: whoever imports a submodule
         # also imports its parent packages.
         self.parent_importers = {}
@@ -953,6 +956,30 @@ def module_diff(modname, old_ns, new_ns):
 
 
 _MISSING = object()
+
+
+def _text_hash(text):
+    import hashlib
+
+    return int.from_bytes(hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=8).digest(), "big")
+
+
+def _fixture_pairs(text):
+    """Same as tests/helpers.py load_sql_fixture_pairs: (meta, sql, expected)."""
+    stmts = "\n".join(line for line in text.splitlines() if line and not line.startswith("--")).split(";")
+    out = []
+    for i in range(0, len(stmts), 2):
+        if i + 1 < len(stmts):
+            sql = stmts[i].strip()
+            lines = sql.split("\n")
+            meta = {}
+            j = 0
+            while lines[j].startswith("#"):
+                key, val = lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            out.append((meta, "\n".join(lines[j:]), stmts[i + 1].strip()))
+    return out
 _WORD_RE = None
 _ITER_RE = None
 _LINES = {}
@@ -1186,7 +1213,7 @@ class Selector:
             return r, reasons + ["rename"]
         if not path.endswith(".py"):
             self.kinds.add("fixture")
-            return self.data_file(path, reasons), reasons
+            return self.data_file(path, reasons, f), reasons
         top = path.split("/")[0]
         if top not in ("sqlglot", "tests"):
             if path in m.opens:
@@ -1596,7 +1623,39 @@ class Selector:
             return r
         return self.module_users(mod)
 
-    def data_file(self, path, reasons):
+    def setup_fixture_users(self, path, f):
+        """For a fixture a test class loads in setUpClass with
+        load_sql_fixture_pairs (TPC queries): of the tests that read that
+        data, those that tokenized one of the changed queries (exact text).
+        None when we cannot tell."""
+        m = self.m
+        if path not in m.setup_users or f is None or f.get("binary"):
+            return None
+        try:
+            old = open(os.path.join(SRC, path), encoding="utf-8").read()
+            new = apply_hunks(old, f["hunks"])
+            po, pn = _fixture_pairs(old), _fixture_pairs(new)
+        except Exception:
+            return None
+        if len(po) != len(pn):
+            return None
+        users = m.s(m.setup_users[path])
+        hit = set()
+        for a, b in zip(po, pn):
+            if a == b:
+                continue
+            if a[0] != b[0]:
+                return None  # a "# key: value" line changed: it steers the test
+            for x, y in ((a[1], b[1]), (a[2], b[2])):
+                if x != y:
+                    if len(x) < 30:
+                        return None  # too short to have been recorded
+                    sid = m.tok_texts.get(str(_text_hash(x)))
+                    if sid is not None:
+                        hit |= m.s(sid)
+        return hit & users
+
+    def data_file(self, path, reasons, f=None):
         m = self.m
         if path is None:
             return set()
@@ -1607,6 +1666,12 @@ class Selector:
                 return set(self.all)
         if path in m.opens:
             reasons.append("opened")
+            narrowed = self.setup_fixture_users(path, f) if m.setup_users else None
+            if narrowed is not None:
+                reasons.append(f"setup users {len(narrowed)}")
+                base = set(m.s(m.call_opens[path])) if path in m.call_opens else set()
+                self.hedge |= m.s(m.opens[path])
+                return base | narrowed
             return set(m.s(m.opens[path]))
         # Never opened: maybe found by listing its folder. Tests that opened
         # a sibling file.
