@@ -1091,10 +1091,12 @@ class Selector:
         stack = [mod]
         while stack:
             cur = stack.pop()
-            edges = list(m.importers.get(cur, [])) + list(m.parent_importers.get(cur, ()))
+            edges = list(m.importers.get(cur, []))
             if imports:
-                # Only for "does it still import?": modules that reach it
-                # through a lazily loaded package name.
+                # Only for "does it still import?": importing a.b.c first runs
+                # package a.b, and some modules reach this one through a
+                # lazily loaded package name.
+                edges += list(m.parent_importers.get(cur, ()))
                 edges += list(m.lazy_importers.get(cur, []))
             for imp in edges:
                 if imp not in seen:
@@ -1106,6 +1108,10 @@ class Selector:
             acc = set()
             for x in seen:
                 acc |= self.direct_users(x)
+                if imports:
+                    # Tests that ran an import of it inside a function.
+                    for f, line in m.func_imports.get(x, ()):
+                        acc |= m.line_info(f, line)[0]
             r = frozenset(acc)
         self._mod_users[key] = r
         return r
@@ -1125,8 +1131,6 @@ class Selector:
             acc |= m.s(m.textreads[path])
         if path.startswith("tests/"):
             acc |= self.by_file.get(path, set())
-        for f, line in m.func_imports.get(mod, ()):
-            acc |= m.line_info(f, line)[0]
         r = frozenset(acc)
         self._direct[mod] = r
         return r
@@ -1316,17 +1320,21 @@ class Selector:
             for k in keys[1]:
                 raw.add(k.upper())
                 add_group(k)
-        # String values of changed entries (old and new), and the keys of
-        # derived string-to-string tables (inverse mappings): generated SQL
-        # shows these, not the edited key.
+        # A table computed from the edited one (an inverse mapping such as
+        # INVERSE_TIME_MAPPING) is what the generator uses: a test whose old
+        # output had the old value, or would now get the new one, is
+        # affected even if it never wrote the edited key. Add the old and
+        # new values of its changed entries. The edited table's own values
+        # (internal codes such as "%Y") are not needed: tests reach them only
+        # through its keys or through the derived table.
         for q, name, keys in diff:
+            if (q, name) in roots:
+                continue
             if not (isinstance(keys, tuple) and keys and keys[0] == "str"):
                 continue
-            for v in keys[2] if len(keys) > 2 else ():
-                add_group(v)
-            if (q, name) not in roots and len(keys) > 3 and keys[3]:
-                for k in keys[1]:
-                    add_group(k)
+            if len(keys) > 3 and keys[3]:
+                for v in keys[2]:
+                    add_group(v)
         if not groups:
             return None
         g = set()
