@@ -224,6 +224,17 @@ class Map:
         self.import_classes = m.get("import_classes", [])
         self.vocab = m.get("vocab", {})
         self.str_sites = m.get("str_sites", {})
+        self.func_imports = m.get("func_imports", {})
+        self.lazy_importers = m.get("lazy_importers", {})
+        self.dyn_import_sites = m.get("dyn_import_sites", [])
+        self.guards = m.get("guards", {})
+        # Importing a.b.c first runs package a.b: whoever imports a submodule
+        # also imports its parent packages.
+        self.parent_importers = {}
+        for name, imps in self.importers.items():
+            parts = name.split(".")
+            for i in range(1, len(parts)):
+                self.parent_importers.setdefault(".".join(parts[:i]), set()).update(imps)
         self._import_anc = None
         # Instantiated classes per ancestor: ancestor -> tests
         self._inst_cache = {}
@@ -899,7 +910,9 @@ def module_diff(modname, old_ns, new_ns):
             if _canon(a) == _canon(b):
                 continue
             keys = None
-            if isinstance(a, dict) and isinstance(b, dict):
+            if type(a) is bool and type(b) is bool:
+                keys = ("bool", a, b)
+            elif isinstance(a, dict) and isinstance(b, dict):
                 ks = []
                 for k in set(a) | set(b):
                     if k not in a or k not in b or _canon(a[k]) != _canon(b[k]):
@@ -1058,32 +1071,64 @@ class Selector:
             t["number"] for t in tests if t["file"] in ("tests/test_docs.py",)
         )
         self._mod_users = {}
+        self._direct = {}
         self.hedge = set()
 
     # -- users of modules and classes ----------------------------------------
 
-    def module_users(self, mod, depth=0):
-        """Tests that use module ``mod`` in any way we can see."""
-        if mod in self._mod_users:
-            return self._mod_users[mod]
-        self._mod_users[mod] = frozenset()  # cycle guard
+    def module_users(self, mod, depth=0, imports=False):
+        """Tests that use module ``mod`` in any way we can see: they ran code
+        in it, created one of its classes, read it as text, or did one of
+        those things with a module that imports it (directly or through a
+        chain of imports). The import graph has cycles, so the chain is
+        walked as a plain reachability search."""
+        key = (mod, imports)
+        r = self._mod_users.get(key)
+        if r is not None:
+            return r
         m = self.m
-        if mod in m.core or mod == "sqlglot":
+        seen = {mod}
+        stack = [mod]
+        while stack:
+            cur = stack.pop()
+            edges = list(m.importers.get(cur, [])) + list(m.parent_importers.get(cur, ()))
+            if imports:
+                # Only for "does it still import?": modules that reach it
+                # through a lazily loaded package name.
+                edges += list(m.lazy_importers.get(cur, []))
+            for imp in edges:
+                if imp not in seen:
+                    seen.add(imp)
+                    stack.append(imp)
+        if any(x in m.core or x == "sqlglot" for x in seen):
             r = self.all
         else:
-            path = path_of_module(mod)
-            r = set(m.file_all(path))
-            for key in m.class_info:
-                if key.split(":", 1)[0] == mod:
-                    r |= m.inst(key)
-            r |= m.s(m.textreads[path]) if path in m.textreads else set()
-            if path.startswith("tests/"):
-                r |= self.by_file.get(path, set())
-            for imp in m.importers.get(mod, []):
-                if imp != mod:
-                    r |= self.module_users(imp, depth + 1)
-            r = frozenset(r)
-        self._mod_users[mod] = r
+            acc = set()
+            for x in seen:
+                acc |= self.direct_users(x)
+            r = frozenset(acc)
+        self._mod_users[key] = r
+        return r
+
+    def direct_users(self, mod):
+        m = self.m
+        r = self._direct.get(mod)
+        if r is not None:
+            return r
+        path = path_of_module(mod)
+        acc = set(m.file_all(path))
+        prefix = mod + ":"
+        for key in m.class_info:
+            if key.startswith(prefix):
+                acc |= m.inst(key)
+        if path in m.textreads and not path.startswith("tests/"):
+            acc |= m.s(m.textreads[path])
+        if path.startswith("tests/"):
+            acc |= self.by_file.get(path, set())
+        for f, line in m.func_imports.get(mod, ()):
+            acc |= m.line_info(f, line)[0]
+        r = frozenset(acc)
+        self._direct[mod] = r
         return r
 
     def class_users(self, mod, qual):
@@ -1337,7 +1382,8 @@ class Selector:
                 reasons.append(f"new method {q}.{name}")
                 r |= base
                 continue
-            readers = self.runtime_readers(name, cls_key, mod, q)
+            flip = keys if isinstance(keys, tuple) and keys and keys[0] == "bool" else None
+            readers = self.runtime_readers(name, cls_key, mod, q, flip)
             self.hedge |= base
             u = set(base)
             if readers is not None:
@@ -1353,7 +1399,7 @@ class Selector:
             r |= u
         return r
 
-    def runtime_readers(self, name, cls_key, mod, qual):
+    def runtime_readers(self, name, cls_key, mod, qual, flip=None):
         """Tests that ran a line reading ``name`` while it mattered. None when
         some read happens where we cannot follow it."""
         m = self.m
@@ -1382,6 +1428,17 @@ class Selector:
                     return None
             if not tests and flags & 10:
                 return None
+            if flip is not None and m.guards:
+                g = m.guards.get(f"{f}:{line}:{name}")
+                if g is not None:
+                    pol, body_line = g
+                    was_on = bool(flip[1]) == (pol == 1)
+                    now_on = bool(flip[2]) == (pol == 1)
+                    if was_on and not now_on:
+                        # The condition can only turn off: tests that never
+                        # entered the body take the same path as before.
+                        self.hedge |= tests
+                        tests = m.line_info(f, body_line)[0]
             r |= tests
         return r
 
@@ -1487,11 +1544,22 @@ class Selector:
         return r
 
     def import_failure(self, path):
+        """Tests that fail when the module at path cannot be imported: every
+        test that imports it, directly, through a chain of imports, inside a
+        function, or through sqlglot's lazy loading of dialects by name."""
         mod = module_of(path)
+        m = self.m
         if not path.startswith("tests/"):
-            # Any sqlglot module may be imported by tests that never use it
-            # (doc tests import every module), so a broken one breaks a lot.
-            return set(self.all)
+            if not m.func_imports and not m.dyn_import_sites:
+                return set(self.all)  # old map: be safe
+            r = set(self.module_users(mod, imports=True))
+            if len(r) < len(self.all):
+                for f, line in m.dyn_import_sites:
+                    r |= m.line_info(f, line)[0]
+                # Insurance in idle worker time: tests that import any module
+                # of the same package.
+                self.hedge |= self.module_users(mod.rpartition(".")[0]) if "." in mod else set()
+            return r
         if path.startswith("tests/"):
             r = set(self.by_file.get(path, set()))
             for imp in self.m.importers.get(mod, []):

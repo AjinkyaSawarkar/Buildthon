@@ -18,7 +18,8 @@ All of this is stored in `selector/map.json.gz`. When a patch arrives, the selec
   - If a line at the top level of a class or module changed (for example a constant or a lookup table), the selector runs the patched module's top-level code in a separate process and compares every class attribute and module name with the original. This shows exactly which names changed, including values that sqlglot computes from them when a class is created. For each changed name, it chooses the tests that use that class or module and that ran a line reading that name. When a changed table is keyed by expression classes, it keeps only the tests that created those expressions. When a changed table of a dialect, tokenizer, parser or generator is keyed by strings (keywords, function names, time format codes), it keeps only the tests whose SQL text, or whose own source code, contains one of the changed strings, plus tests that ran code looking that key up by name or walking the table. While tracing, we recorded every word of every SQL string that each test tokenized or generated.
   - If a patch only swaps `is None` for `== None` (or `is` for `==` with an enum member), the code behaves the same, so nothing is run.
   - If a docstring changed, the doc tests are chosen.
-  - If the new file has a syntax error, or its top-level code fails when we run it, every test is chosen.
+  - If the new file has a syntax error, or its top-level code fails when we run it, the selector chooses every test that imports that module: directly, through a chain of imports, inside a function, or through sqlglot's lazy loading of dialects by name.
+  - If a class flag flips from True to False and code reads it as the condition of an `if` (with no side effects in the rest of the condition), only the tests that entered that `if` block are chosen.
 - **A fixture or other data file.** The tests that opened that file are chosen.
 - **Anything we do not understand.** Every test is chosen. Missing a failing test costs 300 seconds, so being careful is cheaper than guessing.
 
@@ -47,4 +48,4 @@ On the 30 sample commits this selector scores about 115.5 simulated seconds with
 
 ## How we checked it
 
-Besides the 30 sample commits, we made more than 200 patches of our own (random one-line code changes, deleted lines, comment-only changes, fixture edits, test file edits, syntax errors, a new file, a README change, and others). For each one we ran sqlglot's full test suite to find the tests that really fail. The selector missed no failing test on any of them.
+Besides the 30 sample commits, we made more than 230 patches of our own (random one-line code changes, deleted lines, comment-only changes, fixture edits, test file edits, syntax errors, a new file, a README change, and others). For each one we ran sqlglot's full test suite to find the tests that really fail. The selector missed no failing test on any of them.

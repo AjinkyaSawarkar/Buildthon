@@ -189,6 +189,8 @@ def resolve(modname, is_pkg, level, target):
 
 
 importers = {}  # module -> modules importing it at top level (module or class body)
+from_names = []  # (importer, package, name) for "from package import name"
+lazy_importers = {}  # module -> modules that load it through a lazy package name
 for dirpath, _, files in os.walk(root):
     rel_dir = os.path.relpath(dirpath, root)
     if not (rel_dir.startswith("sqlglot") or rel_dir.startswith("tests")) or "__pycache__" in rel_dir:
@@ -211,6 +213,9 @@ for dirpath, _, files in os.walk(root):
             if isinstance(node, ast.ClassDef):
                 stack.extend(node.body)
             elif isinstance(node, (ast.If, ast.Try)):
+                if isinstance(node, ast.If) and "TYPE_CHECKING" in ast.dump(node.test):
+                    stack.extend(node.orelse)  # the body only runs for type checkers
+                    continue
                 for field in ("body", "orelse", "finalbody", "handlers"):
                     stack.extend(getattr(node, field, []) or [])
             elif isinstance(node, ast.ExceptHandler):
@@ -223,6 +228,20 @@ for dirpath, _, files in os.walk(root):
                 importers.setdefault(base, set()).add(me)
                 for a in node.names:
                     importers.setdefault(base + "." + a.name, set()).add(me)
+                    from_names.append((me, base, a.name))
+
+# "from sqlglot.dialects import BigQuery" loads sqlglot.dialects.bigquery
+# lazily: add an edge to the module the imported object comes from.
+for me, base, name in from_names:
+    if not base.startswith("sqlglot"):
+        continue
+    try:
+        obj = getattr(importlib.import_module(base), name)
+    except Exception:
+        continue
+    src_mod = getattr(obj, "__module__", None) if not isinstance(obj, type(sys)) else obj.__name__
+    if isinstance(src_mod, str) and src_mod.startswith("sqlglot") and src_mod != base:
+        lazy_importers.setdefault(src_mod, set()).add(me)
 
 # Where each module- or class-level name is read. A read inside a function
 # body is kind 0 (it happens when the function runs); a read in a module or
@@ -359,6 +378,114 @@ for t in tests:
             for w in _WORDS.findall(sub.value):
                 vocab.setdefault(w.upper(), set()).add(t["number"])
 
+# Flags read as the condition of an ``if``: "file:line:name" -> [polarity,
+# first line of the if body]. polarity 1: ``if X`` or ``if X and ...``;
+# polarity -1: ``if not X`` or ``if not X and ...``. When a flag flip turns
+# such a condition off, only tests that entered the body can change.
+guards = {}
+
+
+def _flag_name(node):
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+_PURE_CALLS = {"isinstance", "len", "type", "bool"}
+
+
+def _pure(node):
+    """No side effects: names, attributes, constants, comparisons, boolean
+    logic and a few builtins."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.NamedExpr) or isinstance(sub, (ast.Await, ast.Yield, ast.YieldFrom)):
+            return False
+        if isinstance(sub, ast.Call):
+            if not (isinstance(sub.func, ast.Name) and sub.func.id in _PURE_CALLS):
+                return False
+    return True
+
+
+def _match_call(node):
+    """self._match...(...): consumes tokens only when it succeeds."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr.startswith("_match")
+        and all(_pure(a) for a in node.args)
+    )
+
+
+def _guard_visit(node, rel):
+    if isinstance(node, (ast.If, ast.While)) and node.body:
+        test = node.test
+        parts = test.values if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And) else [test]
+        for i, p in enumerate(parts):
+            pol = 1
+            if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
+                p, pol = p.operand, -1
+            name = _flag_name(p)
+            if not (name and name in candidates):
+                continue
+            # When the flag turns the condition off, the operands after it
+            # stop running. That is safe only if they have no side effects,
+            # or if the only one left is a _match call (which, when it
+            # succeeds, enters the body anyway).
+            rest = parts[i + 1:]
+            if all(_pure(x) for x in rest) or (len(rest) == 1 and _match_call(rest[0])):
+                guards[f"{rel}:{p.lineno}:{name}"] = [pol, node.body[0].lineno]
+    for ch in ast.iter_child_nodes(node):
+        _guard_visit(ch, rel)
+
+
+for rel, tree in py_sources.items():
+    _guard_visit(tree, rel)
+
+# Imports that run inside functions (``import sqlglot.transforms`` in a
+# method): a test that runs that line needs the module.
+func_imports = {}
+dyn_import_sites = set()  # lines in sqlglot that import a module by name
+
+
+def _fi_visit(node, rel, in_func):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        for ch in ast.iter_child_nodes(node):
+            _fi_visit(ch, rel, True)
+        return
+    if in_func and isinstance(node, ast.Call):
+        f = node.func
+        fname = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+        if fname in ("import_module", "__import__") and rel.startswith("sqlglot"):
+            dyn_import_sites.add((rel, node.lineno))
+    if in_func and isinstance(node, (ast.Import, ast.ImportFrom)):
+        me = module_of(rel)
+        targets = []
+        if isinstance(node, ast.Import):
+            targets = [a.name for a in node.names]
+        else:
+            base = resolve(me, rel.endswith("__init__.py"), node.level, node.module or "")
+            targets = [base] + [base + "." + a.name for a in node.names]
+            for a in node.names:  # lazily loaded names: the module they come from
+                try:
+                    obj = getattr(importlib.import_module(base), a.name)
+                    src_mod = obj.__name__ if isinstance(obj, type(sys)) else getattr(obj, "__module__", None)
+                    if isinstance(src_mod, str):
+                        targets.append(src_mod)
+                except Exception:
+                    pass
+        for t in targets:
+            parts = t.split(".")
+            for i in range(1, len(parts) + 1):
+                func_imports.setdefault(".".join(parts[:i]), set()).add((rel, node.lineno))
+    for ch in ast.iter_child_nodes(node):
+        _fi_visit(ch, rel, in_func)
+
+
+for rel, tree in py_sources.items():
+    _fi_visit(tree, rel, False)
+
 # Upper-cased string constants inside sqlglot functions: code that looks a
 # table up by a fixed key.
 str_sites = {}
@@ -408,10 +535,14 @@ result = {
     "test_ids": [t["id"] for t in tests],
     "core": sorted(core),
     "importers": {k: sorted(v) for k, v in importers.items()},
+    "lazy_importers": {k: sorted(v) for k, v in lazy_importers.items()},
     "sites": {k: sorted(v) for k, v in sites.items()},
     "import_mods": {f"{f}:{ln}": sorted(v) for (f, ln), v in import_mods.items()},
     "import_classes": sorted(import_classes),
     "vocab": {w: sid(s) for w, s in vocab.items()},
+    "func_imports": {k: sorted(v) for k, v in func_imports.items() if k.startswith("sqlglot")},
+    "dyn_import_sites": sorted(dyn_import_sites),
+    "guards": guards,
     "str_sites": {k: sorted(v) for k, v in str_sites.items()},
 }
 with gzip.open(out, "wt", encoding="utf-8") as f:
