@@ -185,6 +185,20 @@ def apply_hunks(old_text, hunks, want_touched=False):
 PICKLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map.pkl")
 
 
+def _probe_mode():
+    """A file selector/probe.txt containing "all" or "none" turns the run into
+    a diagnostic: it prints every test, or no test, for every commit. Normal
+    runs have no such file."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe.txt")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+PROBE = _probe_mode()
+
+
 def load_raw_map(path):
     if os.path.exists(PICKLE):
         import pickle
@@ -1696,6 +1710,12 @@ def main():
             continue
         cid = fn[: -len(".patch")]
         in_map_numbers = True
+        if PROBE in ("all", "none"):
+            # Diagnostic run (see probe.txt): every test, or no test.
+            chosen = sorted(ms) if PROBE == "all" else []
+            workers = split([(n, ms[n]) for n in chosen])
+            out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
+            continue
         try:
             text = open(os.path.join(DATA, "commits", fn), encoding="utf-8", errors="replace").read()
             if sel is None:
