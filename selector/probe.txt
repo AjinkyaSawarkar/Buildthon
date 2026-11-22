@@ -1,1 +1,1 @@
-skip:code
+skip:struct
