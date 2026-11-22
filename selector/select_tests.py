@@ -1185,6 +1185,7 @@ class Selector:
                 r |= self.data_file(p, reasons) if not p.endswith(".py") else self.all
             return r, reasons + ["rename"]
         if not path.endswith(".py"):
+            self.kinds.add("fixture")
             return self.data_file(path, reasons), reasons
         top = path.split("/")[0]
         if top not in ("sqlglot", "tests"):
@@ -1215,6 +1216,7 @@ class Selector:
         try:
             code = compile(new_src, path, "exec", dont_inherit=True)
         except (SyntaxError, ValueError):
+            self.kinds.add("struct")
             reasons.append("syntax error")
             return set(self.import_failure(path)), reasons
         sel = set()
@@ -1224,6 +1226,10 @@ class Selector:
             sel |= m.s(m.textreads[path])
         touched = "\n".join(t for h in f["hunks"] for tag, t in h["lines"] if tag in "+-")
         ch = py_changes(old_src, new_src, module_of(path), touched, (old_t, new_t))
+        if ch.struct or ch.whole:
+            self.kinds.add("struct")
+        elif ch.func_lines:
+            self.kinds.add("code")
         if ch.whole:
             return set(self.module_users(module_of(path))), reasons + ["whole"]
         if ch.doc:
@@ -1618,6 +1624,7 @@ class Selector:
         sel = set()
         reasons = []
         self.hedge = set()
+        self.kinds = set()  # what kind of change this commit is (diagnostics only)
         if not files and patch_text.strip():
             return set(self.all), ["unparsed"]
         for f in files:
@@ -1725,6 +1732,17 @@ def main():
         except Exception as e:
             chosen, why, in_map_numbers = set(ms), [f"error {e}"], False
         sel_map_chosen = set(chosen)
+        if PROBE.startswith("skip:") and sel is not None and in_map_numbers:
+            # Diagnostic run: choose nothing for commits of the named kind.
+            # "code": only function bodies changed; "struct": a module- or
+            # class-level statement changed (or the file breaks); "fixture":
+            # only data files changed.
+            kinds = getattr(sel, "kinds", set())
+            target = PROBE[len("skip:"):]
+            if (target == "code" and kinds == {"code"}) or (target == "struct" and "struct" in kinds) or (
+                target == "fixture" and kinds == {"fixture"}
+            ):
+                chosen = set()
         if to_data is not None and in_map_numbers:
             chosen = {to_data[n] for n in chosen if n in to_data} | (unknown if chosen else set())
         chosen = sorted(n for n in chosen if n in ms)
