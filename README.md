@@ -20,7 +20,7 @@ All of this is stored in `selector/map.json.gz`. When a patch arrives, the selec
   - If a docstring changed, the doc tests are chosen.
   - If the new file has a syntax error, or its top-level code fails when we run it, the selector chooses every test that imports that module: directly, through a chain of imports, inside a function, or through sqlglot's lazy loading of dialects by name.
   - If a class flag flips from True to False and code reads it as the condition of an `if` (with no side effects in the rest of the condition), only the tests that entered that `if` block are chosen.
-- **A fixture or other data file.** The tests that opened that file are chosen.
+- **A fixture or other data file.** The tests that opened that file are chosen. When a test class opens the file once in `setUpClass` and keeps the data on the class (for example `cls.tpch_sqls = load(...)`), only the tests of that class that read that attribute are chosen. While tracing, we recorded which line of `setUpClass` opened each file and which attributes each test read.
 - **Anything we do not understand.** Every test is chosen. Missing a failing test costs 300 seconds, so being careful is cheaper than guessing.
 
 Finally, the chosen tests are split across 1 to 8 workers. For every possible worker count, the program gives each test (longest first) to the least busy worker, and it keeps the worker count with the lowest total cost. On 165 of our test commits this split is only 0.02 seconds above the best possible split in total.

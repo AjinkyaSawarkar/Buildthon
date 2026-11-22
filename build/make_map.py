@@ -87,14 +87,27 @@ for path in glob.glob(os.path.join(trace_dir, "cov.*")):
                 entry[0] |= s
                 entry[1] |= fl
 
+setup_opens_all = []  # (ctx, opened file, setUpClass file, line)
+deferred_setup = []  # (ctx, opened file) for opens during a class setup
+attr_reads = {}  # test number -> attribute names it read on itself
 opens, textreads, classes = {}, {}, {}
 import_classes = set()
 vocab = {}  # upper-case word -> tests whose SQL text (in or out) had it
 for path in glob.glob(os.path.join(trace_dir, "extra.*.pkl")):
     d = pickle.load(open(path, "rb"))
+    for ctx, items in d.get("setup_opens", {}).items():
+        for rel, where, line in items:
+            setup_opens_all.append((ctx, rel, where, line))
+    for ctx, names in d.get("attr_reads", {}).items():
+        n = num.get(ctx[2:]) if ctx.startswith("c:") else None
+        if n is not None:
+            attr_reads.setdefault(n, set()).update(names)
     for ctx, items in d["opens"].items():
         s, _ = expand(ctx)
         for rel, mode in items:
+            if ctx.startswith("s:"):
+                deferred_setup.append((ctx, rel))
+                continue
             opens.setdefault(rel, set()).update(s)
             if rel.endswith(".py") and "b" not in mode:
                 textreads.setdefault(rel, set()).update(s)
@@ -110,6 +123,53 @@ for path in glob.glob(os.path.join(trace_dir, "extra.*.pkl")):
         s, _ = expand(ctx)
         for name in items:
             classes.setdefault(name, set()).update(s)
+
+# A file opened while a class set itself up (setUpClass) matters to the
+# tests of that class that read what that line of setUpClass stored on the
+# class (cls.tpch_sqls = load(...)), not to every test in the class.
+def _setup_stmt_attrs(where, line):
+    import ast
+
+    try:
+        tree = ast.parse(open(os.path.join(root, where), encoding="utf-8").read())
+    except Exception:
+        return None
+    best = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "setUpClass":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.stmt) and not isinstance(sub, (ast.FunctionDef, ast.For, ast.While, ast.If, ast.With, ast.Try)):
+                    if sub.lineno <= line <= (sub.end_lineno or sub.lineno):
+                        if best is None or (sub.end_lineno - sub.lineno) < (best.end_lineno - best.lineno):
+                            best = sub
+    if best is None:
+        return None
+    names = set()
+    for sub in ast.walk(best):
+        if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id in ("cls", "self"):
+            names.add(sub.attr)
+    return names or None
+
+
+_setup_where = {}
+for ctx, rel, where, line in setup_opens_all:
+    _setup_where.setdefault((ctx, rel), set()).add((where, line))
+for ctx, rel in deferred_setup:
+    full, _ = expand(ctx)  # every test of the class
+    attrs = set()
+    ok = (ctx, rel) in _setup_where
+    for where, line in _setup_where.get((ctx, rel), ()):
+        a = _setup_stmt_attrs(where, line)
+        if a is None:
+            ok = False
+            break
+        attrs |= a
+    if ok and attrs:
+        users = {n for n in full if attr_reads.get(n, set()) & attrs}
+        opens.setdefault(rel, set()).update(users)
+        print("setup open narrowed", rel, sorted(attrs), len(full), "->", len(users), file=sys.stderr)
+    else:
+        opens.setdefault(rel, set()).update(full)
 
 # MRO of every recorded class, restricted to sqlglot classes.
 mro = {}

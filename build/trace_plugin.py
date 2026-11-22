@@ -27,6 +27,8 @@ ROOT = os.path.abspath(os.environ.get("TRACE_ROOT", os.getcwd()))
 
 _state = {"ctx": "import"}
 _opens = {}  # ctx -> set of (relpath, mode)
+_setup_opens = {}  # ctx -> set of (opened relpath, setUpClass file, line)
+_attr_reads = {}  # ctx -> attribute names read on the test case instance
 _classes = {}  # ctx -> set of "module:qualname"
 _cov = None
 
@@ -46,6 +48,14 @@ def _audit(event, args):
             return
         mode = args[1] if len(args) > 1 and isinstance(args[1], str) else "r"
         _opens.setdefault(_state["ctx"], set()).add((rel, mode))
+        if _state["ctx"].startswith("s:"):
+            # Which line of setUpClass caused this open?
+            f = sys._getframe(1)
+            while f is not None and f.f_code.co_name != "setUpClass":
+                f = f.f_back
+            if f is not None:
+                where = os.path.relpath(os.path.abspath(f.f_code.co_filename), ROOT)
+                _setup_opens.setdefault(_state["ctx"], set()).add((rel, where, f.f_lineno))
     except Exception:
         pass
 
@@ -101,7 +111,8 @@ def _child_start():
         cov.stop()
         cov.save()
         with open(os.path.join(OUT, f"extra.{os.getpid()}.pkl"), "wb") as f:
-            pickle.dump({"opens": _opens, "classes": _classes, "words": _words}, f)
+            pickle.dump({"opens": _opens, "classes": _classes, "words": _words,
+                     "setup_opens": _setup_opens, "attr_reads": _attr_reads}, f)
 
     multiprocessing.util.Finalize(None, _save, exitpriority=100)
     _child["cov"] = cov
@@ -212,6 +223,21 @@ def _import_everything(cov=None):
         getattr(sqlglot.dialects, name)
 
 
+def _track_testcase_reads():
+    import unittest
+
+    get = object.__getattribute__
+
+    def __getattribute__(self, name):
+        if name[:1] != "_" or not name.startswith("__"):
+            ctx = _state["ctx"]
+            if ctx.startswith("c:"):
+                _attr_reads.setdefault(ctx, set()).add(name)
+        return get(self, name)
+
+    unittest.TestCase.__getattribute__ = __getattribute__
+
+
 def pytest_configure(config):
     global _cov
     if getattr(config, "workerinput", None) is None and config.getoption("numprocesses", None):
@@ -224,6 +250,7 @@ def pytest_configure(config):
         config_file=False,
     )
     _cov.start()
+    _track_testcase_reads()
     _set("import:?")
     _ImportTracker(_cov).run(_import_core)
     _wrap_all()
@@ -373,4 +400,5 @@ def pytest_unconfigure(config):
     _cov.stop()
     _cov.save()
     with open(os.path.join(OUT, f"extra.{os.getpid()}.pkl"), "wb") as f:
-        pickle.dump({"opens": _opens, "classes": _classes, "words": _words}, f)
+        pickle.dump({"opens": _opens, "classes": _classes, "words": _words,
+                     "setup_opens": _setup_opens, "attr_reads": _attr_reads}, f)
