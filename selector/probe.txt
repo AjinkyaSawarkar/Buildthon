@@ -1,1 +1,1 @@
-skip:struct
+skip:fixture
